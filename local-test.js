@@ -4,7 +4,7 @@ const { handler } = require('./index'); // Adjust the path to your Lambda functi
 (async () => {
   // Simulate the event object that would be passed to the Lambda function
   const event = {
-    url: 'https://www.npr.org/sections/news/' // Example URL
+    url: 'https://www.democracynow.org/headlines' // Example URL for Democracy Now! headlines
   };
 
   const context = {}; // Mock context object if needed

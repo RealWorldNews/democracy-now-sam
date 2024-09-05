@@ -5,15 +5,14 @@ const { Client } = require('pg');
 const cuid = require('cuid');
 require('dotenv').config();
 
-const processBody = (body, link, resource = 'NPR') => {
+const processBody = (body, link, resource = 'Democracy Now!') => {
   let formattedBody = '';
 
   if (body) {
-    formattedBody += `<p>${body}</p><br><br><ul><li><a href='${link}'>Visit ${resource}</a></li></ul>`;
-  } else if (link) {
-    formattedBody += `<br><br><ul><li><a href='${link}'>Visit article @ ${resource}</a></li></ul>`;
+    formattedBody += body; // Keep body content as extracted with formatting
   }
 
+  formattedBody += `<br><br><ul><li><a href='${link}'>Visit ${resource}</a></li></ul>`;
   return formattedBody;
 };
 
@@ -36,15 +35,34 @@ const insertArticleIntoDatabase = async (client, article) => {
   );
 };
 
-exports.handler = async (event, context) => {
-  const websiteUrl = event.url || 'https://www.npr.org/sections/news/'; // Use the NPR News URL directly or pass via event
+const convertDateToUTC = (dateString) => {
+  const date = new Date(dateString);
+  return date.toISOString();
+};
 
-  if (!websiteUrl) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify('URL is required')
-    };
+const slugExists = async (client, slug) => {
+  const result = await client.query('SELECT 1 FROM "Article" WHERE slug = $1', [slug]);
+  return result.rowCount > 0;
+};
+
+const generateSlug = (headline) => {
+  return headline.split(' ').slice(0, 3).join('').toLowerCase().replace(/[^a-z]/g, '');
+};
+
+const ensureUniqueSlug = async (client, headline) => {
+  let slug = generateSlug(headline);
+  let suffix = 1;
+
+  while (await slugExists(client, slug)) {
+    slug = `${generateSlug(headline)}-${suffix}`;
+    suffix++;
   }
+
+  return slug;
+};
+
+exports.handler = async (event, context) => {
+  const websiteUrl = 'https://www.democracynow.org/headlines';
 
   const client = new Client({
     connectionString: process.env.POSTGRES_CONNECTION_STRING_DEV
@@ -55,8 +73,8 @@ exports.handler = async (event, context) => {
     await client.connect();
     console.log('Connected to the database successfully.');
 
-    await client.query('DELETE FROM "Article" WHERE resource = $1', ['NPR']);
-    console.log('Truncated existing articles with resource "NPR".');
+    await client.query('DELETE FROM "Article" WHERE resource = $1', ['Democracy Now!']);
+    console.log('Truncated existing articles with resource "Democracy Now!".');
 
     const browser = await puppeteer.launch({
       args: chromium ? chromium.args : [],
@@ -67,146 +85,94 @@ exports.handler = async (event, context) => {
     });
 
     const page = await browser.newPage();
-    console.log('Navigating to NPR News section...');
+    console.log('Navigating to Democracy Now! headlines page...');
     try {
-      await page.goto(websiteUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 6000
-      });
+      await page.goto(websiteUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
       console.log('Page loaded successfully');
     } catch (error) {
-      console.error('Failed to load NPR News page:', error);
+      console.error('Failed to load Democracy Now! headlines page:', error);
       await browser.close();
       await client.end();
-      return {
-        statusCode: 500,
-        body: JSON.stringify('Failed to load the website')
-      };
+      return;
     }
 
-    // Scrape the articles
-    const articlesData = await page.$$eval('.item', items =>
-      items.map(item => ({
-        headline: item.querySelector('.title a')?.innerText.trim(),
-        link: item.querySelector('.title a')?.href.trim(),
-        date: item.querySelector('.teaser time')?.getAttribute('datetime').trim()
-      }))
+    const articles = await page.$$eval('.news_item', items =>
+      items.map(item => {
+        const headline = item.querySelector('h3 a')?.innerText.trim();
+        const link = 'https://www.democracynow.org' + item.querySelector('h3 a')?.getAttribute('href').trim();
+        const date = item.querySelector('.date')?.innerText.trim();
+        return { headline, link, date };
+      })
     );
-    
-    const articles = articlesData.map(data => {
 
-      let formattedDate = data.date;
-      if (formattedDate.length === 19) { 
-        formattedDate += '.000'; 
-      }
-
-      const baseSlug = data.headline.split(' ').slice(0, 3).join('').toLowerCase().replace(/[^a-z]/g, '');
-    
-      const randomNum = Math.floor(Math.random() * 2000) + 1;
-    
-      return {
-        id: cuid(),
-        headline: data.headline,
-        link: data.link,
-        date: formattedDate,
-        slug: `${baseSlug}-${randomNum}`, // Append random number to the slug
-        resource: 'NPR',
-        summary: '',
-        body: '',
-        author: '',
-        media: ''
-      };
-    });
-    
-
+    console.log('Collected headlines and links:', articles);
 
     for (const article of articles) {
+      console.log(`Visiting article: ${article.headline}`);
 
       let success = false;
       let attempts = 0;
-      const maxAttempts = 3;
+      article.slug = await ensureUniqueSlug(client, article.headline);
 
-      while (!success && attempts < maxAttempts) {
+      while (!success && attempts < 3) {
         attempts++;
         try {
-          await page.goto(article.link, {
-            waitUntil: 'networkidle0',
-            timeout: 30000
-          });
+          await page.goto(article.link, { waitUntil: 'domcontentloaded', timeout: 10000 });
 
+          // Extract the date
           try {
-            const media = await page.$eval(
-              'div.imagewrap.has-source-dimensions picture img',
-              img => img.getAttribute('src')
-            );
-            article.media = media;
-          } catch (error) {
-            console.error('Error finding media content: ', error);
-            article.media = '';
+            const date = await page.$eval('.news_label .date', el => el.innerText.trim());
+            article.date = convertDateToUTC(date);
+          } catch (err) {
+            console.error('Error finding date: ', err);
+            article.date = new Date().toISOString().split('T')[0];
           }
 
+          // Extract the body and summary
           try {
-            const bodyContent = await page.$$eval('#storytext p', paragraphs =>
-              paragraphs.map(p => p.innerText.trim()).join('\n\n')
+            const bodyContent = await page.$$eval('div.headline_summary p', paragraphs =>
+              paragraphs.map(p => `<p>${p.innerText.trim()}</p>`).join('')
             );
-
-            article.summary = bodyContent.split(' ').slice(0, 25).join(' ') + '...';
-            article.body = processBody(bodyContent, article.link);
+            article.body = bodyContent;
+            article.summary = bodyContent.replace(/<[^>]+>/g, '').split(' ').slice(0, 25).join(' ') + '...';
           } catch (err) {
             console.error('Error finding body content: ', err);
-            article.summary = '';
             article.body = '';
+            article.summary = '';
           }
 
+          // Extract the media
           try {
-            const author = await page.$eval('.byline__name a', name =>
-              name.innerText.trim()
-            );
-            article.author = author;
+            const media = await page.$eval('article.headline img[itemprop="image"]', el => el.getAttribute('src'));
+            article.media = media;
           } catch (err) {
-            try {
-              const author = await page.$eval(
-                '.byline__name.byline__name--block',
-                name => name.innerText.trim()
-              );
-              article.author = author;
-            } catch (err) {
-              try {
-                const author = await page.$eval('.byline__name', element =>
-                  element.innerText.trim()
-                );
-                article.author = author;
-              } catch (err) {
-                console.error('Error finding author: ', err);
-                article.author = 'See article for details';
-              }
-            }
+            console.error('Error finding media content: ', err);
+            article.media = 'https://npr.brightspotcdn.com/dims4/default/0f33387/2147483647/strip/true/crop/1200x630+0+260/resize/1200x630!/quality/90/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F69%2F34%2F879932ae4dbcbb5abb2f7dce90eb%2Fdemocracy-now-square-logo-2021.jpg';
           }
 
-          await insertArticleIntoDatabase(client, article);
+          article.body = processBody(article.body, article.link);
+          article.author = 'See article for details'; // Placeholder since Democracy Now! doesn't list authors
+          article.resource = 'Democracy Now!';
+          article.id = cuid();
 
+          // Insert into the database
+          await insertArticleIntoDatabase(client, article);
           success = true;
           console.log(`Collected and saved data for article: ${article.headline}`);
         } catch (error) {
-          console.error(
-            `Error processing article: ${article.headline}, attempt ${attempts}`,
-            error
-          );
-          if (attempts >= maxAttempts) {
-            console.error(`Failed to load article after ${maxAttempts} attempts.`);
+          console.error(`Error processing article: ${article.headline}, attempt ${attempts}`, error);
+          if (attempts >= 3) {
+            console.error(`Failed to load article after ${attempts} attempts.`);
           }
         }
       }
     }
 
     await browser.close();
-
-    const response = {
+    return {
       statusCode: 200,
       body: JSON.stringify({ message: 'Scraping completed successfully', articles }),
     };
-
-    return response;
   } catch (error) {
     console.error('Error:', error);
     return {
